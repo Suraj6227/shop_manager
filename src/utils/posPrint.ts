@@ -41,8 +41,10 @@ export class POSPrinter {
   public static formatReceipt(data: PrintData): string {
     let receipt = '';
 
-    // Initialize printer
+    // Initialize printer with proper wake-up sequence
     receipt += this.INIT;
+    receipt += this.ESC + '@'; // Initialize again for safety
+    receipt += '\x0A'; // Line feed to wake up printer
 
     // Store name (centered, bold, double size)
     receipt += this.ALIGN_CENTER;
@@ -127,32 +129,168 @@ export class POSPrinter {
 
   public static async print(data: PrintData): Promise<void> {
     try {
-      // Try to use Web Serial API for direct printer communication
-      if ('serial' in navigator) {
-        await this.printViaSerial(data);
-      } else {
-        // Fallback to raw text printing with specific formatting
-        await this.printViaRawText(data);
-      }
+      // Try multiple printing methods for POS compatibility
+      await this.printViaPOSCommand(data);
     } catch (error) {
-      console.error('Print error:', error);
-      // Final fallback to browser print
-      this.printViaBrowser(data);
+      console.error('POS print error:', error);
+      try {
+        // Try Web Serial API
+        if ('serial' in navigator) {
+          await this.printViaSerial(data);
+        } else {
+          throw new Error('Serial API not available');
+        }
+      } catch (serialError) {
+        console.error('Serial print error:', serialError);
+        // Final fallback to browser print
+        this.printViaBrowser(data);
+      }
     }
+  }
+
+  private static async printViaPOSCommand(data: PrintData): Promise<void> {
+    const receiptData = this.formatReceipt(data);
+    
+    // Try direct printer communication via various methods
+    const methods = [
+      () => this.printViaWebUSB(receiptData),
+      () => this.printViaAndroidIntent(receiptData),
+      () => this.printViaWindowsPrint(receiptData),
+      () => this.printViaRawSocket(receiptData)
+    ];
+
+    for (const method of methods) {
+      try {
+        await method();
+        return; // Success, exit
+      } catch (error) {
+        console.log('Print method failed, trying next...', error);
+        continue;
+      }
+    }
+    
+    throw new Error('All POS print methods failed');
+  }
+
+  private static async printViaWebUSB(receiptData: string): Promise<void> {
+    if (!('usb' in navigator)) throw new Error('WebUSB not supported');
+    
+    try {
+      const device = await (navigator as any).usb.requestDevice({
+        filters: [
+          { vendorId: 0x04b8 }, // Epson
+          { vendorId: 0x0519 }, // Star Micronics
+          { vendorId: 0x0dd4 }, // Citizen
+        ]
+      });
+      
+      await device.open();
+      await device.selectConfiguration(1);
+      await device.claimInterface(0);
+      
+      const encoder = new TextEncoder();
+      const data = encoder.encode(receiptData);
+      
+      await device.transferOut(1, data);
+      await device.close();
+    } catch (error) {
+      throw new Error('WebUSB print failed: ' + error);
+    }
+  }
+
+  private static async printViaAndroidIntent(receiptData: string): Promise<void> {
+    // For Android POS systems
+    if (typeof (window as any).Android !== 'undefined') {
+      (window as any).Android.print(receiptData);
+      return;
+    }
+    
+    // Try Android Intent
+    if ('androidIntent' in window) {
+      (window as any).androidIntent.print(receiptData);
+      return;
+    }
+    
+    throw new Error('Android print interface not available');
+  }
+
+  private static async printViaWindowsPrint(receiptData: string): Promise<void> {
+    // For Windows-based POS systems
+    if (typeof (window as any).external !== 'undefined' && (window as any).external.print) {
+      (window as any).external.print(receiptData);
+      return;
+    }
+    
+    throw new Error('Windows print interface not available');
+  }
+
+  private static async printViaRawSocket(receiptData: string): Promise<void> {
+    // Try to send directly to printer IP (common in POS setups)
+    const printerIPs = ['192.168.1.100', '192.168.0.100', '10.0.0.100'];
+    
+    for (const ip of printerIPs) {
+      try {
+        const response = await fetch(`http://${ip}:9100`, {
+          method: 'POST',
+          body: receiptData,
+          headers: {
+            'Content-Type': 'application/octet-stream'
+          }
+        });
+        
+        if (response.ok) return;
+      } catch (error) {
+        continue;
+      }
+    }
+    
+    throw new Error('Raw socket print failed');
   }
 
   private static async printViaSerial(data: PrintData): Promise<void> {
     try {
-      // Request serial port access
+      // Request serial port access with multiple baud rate attempts
       const port = await (navigator as any).serial.requestPort();
-      await port.open({ baudRate: 9600 });
+      
+      // Try common POS printer baud rates
+      const baudRates = [9600, 115200, 38400, 19200];
+      let connected = false;
+      
+      for (const baudRate of baudRates) {
+        try {
+          await port.open({ 
+            baudRate, 
+            dataBits: 8, 
+            stopBits: 1, 
+            parity: 'none',
+            flowControl: 'none'
+          });
+          connected = true;
+          break;
+        } catch (error) {
+          console.log(`Failed to connect at ${baudRate} baud`);
+          continue;
+        }
+      }
+      
+      if (!connected) {
+        throw new Error('Could not establish serial connection');
+      }
 
       const writer = port.writable.getWriter();
       const receiptData = this.formatReceipt(data);
       
-      // Convert string to Uint8Array
+      // Convert string to Uint8Array and send in chunks
       const encoder = new TextEncoder();
-      await writer.write(encoder.encode(receiptData));
+      const dataArray = encoder.encode(receiptData);
+      
+      // Send data in smaller chunks for better compatibility
+      const chunkSize = 64;
+      for (let i = 0; i < dataArray.length; i += chunkSize) {
+        const chunk = dataArray.slice(i, i + chunkSize);
+        await writer.write(chunk);
+        await new Promise(resolve => setTimeout(resolve, 10)); // Small delay between chunks
+      }
       
       writer.releaseLock();
       await port.close();
